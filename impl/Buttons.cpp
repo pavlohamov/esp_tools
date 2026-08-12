@@ -51,7 +51,10 @@ public:
 			.intr_type = GPIO_INTR_ANYEDGE,
 		};
 		ESP_ERROR_CHECK(gpio_config(&cfg));
-		ESP_ERROR_CHECK(gpio_isr_handler_add(_gpio, onButtonCb, this));
+		if (gpio_isr_handler_add(_gpio, onButtonCb, this)) {
+			ESP_ERROR_CHECK(gpio_install_isr_service(0));
+			ESP_ERROR_CHECK(gpio_isr_handler_add(_gpio, onButtonCb, this));
+		}
 		ESP_ERROR_CHECK(gpio_intr_enable(_gpio));
 	}
 
@@ -128,9 +131,6 @@ public:
 };
 
 std::shared_ptr<Button> Wrapper::add(int gpio, bool actlo, int signal, onButtonEvt_f cb, void *arg) {
-
-	gpio_install_isr_service(0);
-
 	auto b = std::make_shared<Button>((gpio_num_t)gpio, actlo, signal, cb, arg);
 	if (!b) {
 		ESP_LOGE(TAG, "No MEM!");

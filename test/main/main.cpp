@@ -20,7 +20,7 @@ bool Test_Buttons();
 extern "C" void app_main(void) {
 	static const auto tests = {
 		Test_Runnable,
-//		Test_Storage,
+		Test_Storage,
 		Test_Buttons,
 	};
 	ESP_LOGI(TAG, "START");
