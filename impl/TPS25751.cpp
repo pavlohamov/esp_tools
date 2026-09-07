@@ -9,6 +9,7 @@
 #include "TPS25751.hpp"
 
 #include <endian.h>
+#include <mutex>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -81,7 +82,8 @@ struct AutonegotiateSink {
 	uint32_t autoComputeSinkMinVolt:1;
 	uint32_t autoComputeSinkMaxVolt:1;
 	uint32_t autoDisableSink:1;
-	uint32_t :15;
+	uint32_t :5;
+	uint32_t autoNegMaxCurrent:10; // 250mw
 	uint32_t autoNegSinkMinPower:10; // 250mw
 	uint32_t autoNegMaxVolt:10; // 50mw
 	uint32_t autoNegMinVolt:10; // 50mw
@@ -96,7 +98,9 @@ struct AutonegotiateSink {
 	uint32_t ppsOpCurrent:7; // 50ma
 	uint32_t :2;
 	uint32_t ppsOpVoltage:11; // 20mV
-	uint32_t :76;
+	uint32_t :32;
+	uint32_t :32;
+	uint32_t :12;
 } __attribute__((packed));
 
 struct PBMs_Data_Out { // 6 bytes
@@ -139,52 +143,35 @@ struct PowerPathStatus_Out {
 } __attribute__((packed));
 
 
-struct USB_PDO_fixed { // 00
-	uint16_t maxCurrent:10; // (10 mA/unit)
-	uint16_t voltage:10; // (50 mV/unit)
-	uint16_t peakCurrent:2;
+struct PortControl {
+	uint16_t current:2;
+	uint16_t :2;
+	uint16_t processSwap2Sink:1;
+	uint16_t initiateSwap2Sink:1;
+	uint16_t processSwap2Source:1;
+	uint16_t initiateSwap2Source:1;
+	uint16_t :4;
+	uint16_t processSwap2UFP:1;
+	uint16_t initiateSwap2UFP:1;
+	uint16_t processSwap2DFP:1;
+	uint16_t initiateSwap2DFP:1;
+	uint16_t autoIDrequest:1;
+	uint16_t :2;
+	uint16_t unconstrainedPower:1;
+	uint16_t enableCurrentMonitor:1;
+	uint16_t :3;
+	uint16_t r15kPresent:1;
+	uint16_t dcdEna:1;
+	uint16_t dcdAdvertEna:3;
 	uint16_t :1;
-	uint16_t eprCappable:1;
-	uint16_t unchunkedExt:1;
-	uint16_t dualRoleData:1;
-	uint16_t usbCappable:1;
-	uint16_t unconstraintPower:1;
-	uint16_t suspendSupported:1;
-	uint16_t dualRole:1;
+	uint16_t dcdChargerEna:2;
 } __attribute__((packed));
 
-struct USB_PDO_battery { // 01
-} __attribute__((packed));
+static_assert(sizeof(PortControl) == 4);
 
-struct USB_PDO_variable { // 10
-} __attribute__((packed));
 
-struct USB_PDO_srsPps { // 11-00 APDO
-} __attribute__((packed));
-struct USB_PDO_eprAvs { // 11-01 APDO
-} __attribute__((packed));
-
-union USB_PDO {
-	struct {
-		union {
-			USB_PDO_fixed fix;
-			USB_PDO_battery batt;
-			USB_PDO_variable var;
-			USB_PDO_srsPps pps;
-			USB_PDO_eprAvs avs;
-		};
-	};
-	union {
-		uint32_t raw;
-		struct {
-			uint32_t :30;
-			uint32_t type:2;
-		};
-	};
-} __attribute__((packed));
-
-TPS25751::TPS25751(i2c_master_bus_handle_t bus, int addr, gpio_num_t gpio_irq):
-		bus_(bus), gpio_irq_(gpio_irq), dev_(nullptr), pending_(xSemaphoreCreateBinary()), charger_(nullptr) {
+TPS25751::TPS25751(i2c_master_bus_handle_t bus, uint8_t addr, gpio_num_t gpio_irq, uint8_t bqaddr):
+		bus_(bus), gpio_irq_(gpio_irq), bqaddr_(bqaddr), dev_(nullptr), pending_(xSemaphoreCreateBinary()), lock_() {
 
 	const i2c_device_config_t i2_conf = {
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -220,23 +207,86 @@ TPS25751::~TPS25751() noexcept {
 }
 
 
-void TPS25751::run() noexcept {
+bool TPS25751::read_caps(int regadr, usbpd::source_capabilities& out, int extraOffset) {
 
-
-	auto writer = [&](uint8_t i2c_addr, uint8_t reg, const void *data, size_t len) {
-		return i2c_write(i2c_addr, reg, data, len);
-	};
-	auto reader = [&](uint8_t i2c_addr, uint8_t reg, void *data, size_t len) {
-		return i2c_read(i2c_addr, reg, data, len);
-	};
+	std::lock_guard<MutexRecursiveFr> guard(lock_);
 
 	std::vector<uint8_t> data;
+	int rv = readreg(regadr, data);
+	if (rv) {
+		ESP_LOGE(TAG, "not read %d", rv);
+		return false;
+	}
+	const auto ptr = data.data();
+	const uint8_t len = ptr[0];
+	if (len < 2) {
+		return false;
+	}
 
+	const uint8_t n = ptr[1] & 0x07;
+	if (n == 0 || (1u + 1u + 4u * n) > len) {
+		return false;
+	}
+
+	out.clear();
+	for (uint8_t i = 0; i < n; ++i) {
+		const uint8_t* p = &ptr[2 + extraOffset + 4 * i];
+		out.add(usbpd::pdo{ uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24 });
+	}
+	return true;
+}
+
+
+bool TPS25751::autoneg_set(const usbpd::source_capabilities::selection& sel) {
+	std::vector<uint8_t> data;
+	if (readreg(0x37, data))
+		return false;
+	AutonegotiateSink *as = (AutonegotiateSink*)(data.data() + 1);
+
+	as->autoComputeSinkMaxVolt = 0;
+	writereg(0x37, (uint8_t*)as, sizeof(*as));
+	as->autoNegMaxVolt = sel.voltage.milli() / 50;
+	//				as->autoNegSinkMinPower = 5000 * 3 / 250;
+	////				as->autoNegMissmatchPower = 100000 / 250;
+	as->noCapMissmatch = 0;
+	writereg(0x37, (uint8_t*)as, sizeof(*as));
+	write_4CC("ANeg");
+	return true;
+}
+
+bool TPS25751::read_rx_source_caps(usbpd::source_capabilities& out) {
+	return read_caps(0x30, out);
+}
+
+bool TPS25751::read_rx_sink_caps(usbpd::source_capabilities& out) {
+	return read_caps(0x31, out);
+}
+
+bool TPS25751::read_tx_source_caps(usbpd::source_capabilities& out) {
+	return read_caps(0x32, out, 2);
+}
+
+bool TPS25751::read_tx_sink_caps(usbpd::source_capabilities& out) {
+	return read_caps(0x33, out);
+}
+
+bool TPS25751::read_active_pdo(usbpd::pdo& pdo) {
+	std::vector<uint8_t> data;
+	if (readreg(0x34, data))
+		return false;
+	pdo = usbpd::pdo(*(uint32_t*)(data.data() + 1));
+	return true;
+}
+
+int TPS25751::initialize() {
+
+	std::vector<uint8_t> data;
 	const uint64_t start_at = esp_timer_get_time();
 	bool wait = false;
 	do {
 		if (wait)
 			vTaskDelay(pdMS_TO_TICKS(150));
+		std::lock_guard<MutexRecursiveFr> guard(lock_);
 		wait = true;
 		int rv = readreg(3, data);
 		if (rv)
@@ -244,48 +294,35 @@ void TPS25751::run() noexcept {
 
 		const State st = decodeState(data.data() + 1);
 		if (st == APP) {
-			ESP_LOGW(TAG, "APP. Send GAID. May restart if dead battery");
 #if 01
 			break;
 #else
-			sendcmd1("GAID");
+			ESP_LOGW(TAG, "APP. Send GAID. May restart if dead battery");
+			write_4CC("GAID");
 			continue;
 #endif
 		}
+		ESP_LOGW(TAG, "state %d '%.4s'", st, data.data() + 1);
 
 		rv = writereg(0x16, s_enableCMD1irq, sizeof(s_enableCMD1irq));
 		if (rv) {
 			ESP_LOGE(TAG, "ena CMD1 interrupt %d", rv);
 			continue;
 		}
-		rv = writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
-		if (rv) {
-			ESP_LOGE(TAG, "clear CMD1 interrupt %d", rv);
-			continue;
-		}
 
 		static const PBMs_Data_Out pbdata = {
 			.size = _binary_TPS25751_bin_end - _binary_TPS25751_bin_start,
 			.i2c_addr = 0x30,
-			.i2c_tout = 0x31,
+			.i2c_tout = 0x3F,
 		};
-		rv = writereg(0x09, (uint8_t*)&pbdata, sizeof(pbdata));
-		if (rv) {
-			ESP_LOGE(TAG, "cmd data err %d", rv);
-			continue;
-		}
 
-		rv = sendcmd1("PBMs");
+		rv = write_4CC("PBMs", &pbdata, sizeof(pbdata), data);
 		if (rv) {
 			ESP_LOGE(TAG, "PBMs err");
+//			write_4CC("GAID");
 			continue;
 		}
 
-		rv = readreg(0x09, data);
-		if (rv) {
-			ESP_LOGE(TAG, "read 9 = %d", rv);
-			continue;
-		}
 		if (data.data()[5] != pbdata.i2c_addr) {
 			ESP_LOGE(TAG, "address 0x%X != 0x%X", data.data()[5], pbdata.i2c_addr);
 			continue;
@@ -302,19 +339,13 @@ void TPS25751::run() noexcept {
 			continue;
 		}
 
-		rv = sendcmd1("PBMc");
+		rv = write_4CC("PBMc", nullptr, 0, data);
 		if (rv) {
-			ESP_LOGW(TAG, "PBMc err");
+			ESP_LOGE(TAG, "PBMc err");
 			continue;
 		}
 
-		rv = readreg(9, data);
-		if (rv) {
-			ESP_LOGE(TAG, "data read %d", rv);
-			continue;
-		}
-
-//		vTaskDelay(pdMS_TO_TICKS(20));
+		vTaskDelay(pdMS_TO_TICKS(20));
 
 		rv = readreg(3, data);
 		if (rv) {
@@ -322,142 +353,82 @@ void TPS25751::run() noexcept {
 			continue;
 		}
 
-		if (decodeState(data.data() + 1) == APP)
+		if (decodeState(data.data() + 1) == APP) {
+			writereg(0x16, s_enableCMD1irq, sizeof(s_enableCMD1irq));
+			writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
+			if (!readreg(0x2D, data)) {
+				if (data.data()[1] & 4)
+					write_4CC("DBfg");
+			}
 			break;
+		}
 
 	} while (running());
 
-	// todo: check if charger present
-	if (1) {
-		if (charger_)
-			delete charger_;
-		charger_ = new BQ25798(BQ25798_ADR, writer, reader);
+	const uint32_t loading_took = (esp_timer_get_time() - start_at) / 1000UL;
+	if (loading_took > 50)
+		ESP_LOGI(TAG, "loading_took %d", loading_took);
+
+	if (bqaddr_ && !charger_) {
+		auto writer = [&](uint8_t i2c_addr, uint8_t reg, const void *data, size_t size) {
+			return i2c_write(i2c_addr, reg, data, size);
+		};
+		auto reader = [&](uint8_t i2c_addr, uint8_t reg, void *data, size_t size) {
+			return i2c_read(i2c_addr, reg, data, size);
+		};
+		charger_ = std::make_unique<BQ25798>(bqaddr_, writer, reader);
 	}
 
-	const uint64_t loading_took = esp_timer_get_time() - start_at;
-	ESP_LOGI(TAG, "loading_took %d", (int)(loading_took / 1000UL));
+	return 0;
+}
 
-	writereg(0x16, s_enableCMD1irq, sizeof(s_enableCMD1irq));
-	writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
+void TPS25751::run() noexcept {
+
+//	esp_log_level_set("TPS25751", ESP_LOG_VERBOSE);
+	Status_Out status{};
+	status.socAckTout = 1; // just to force reload
 
 	int rv = 0;
-//	rv = sendcmd1("DBfg");
-//	if (rv) {
-//		ESP_LOGE(TAG, "DBfg err");
-//	}
-//
-//	rv = sendcmd1("GSrC");
-//	if (rv) {
-//		ESP_LOGE(TAG, "GSrC err");
-//	}
-//
-//	rv = sendcmd1("SWSk");
-//	if (rv) {
-//		ESP_LOGE(TAG, "SWSk err");
-//	}
-
-	xSemaphoreGive(pending_);
-
-	if (charger_) {
-		vTaskDelay(pdMS_TO_TICKS(500));
-		charger_->setAdcState(true);
-		charger_->setInputLimitA(2000);
-		charger_->setChargeLimitA(1500);
-		charger_->setInputLimitV(4000); // minimal operating voltage
-		charger_->setPrechargeLimitA(160);
-		charger_->setTerminationA(160);
-		charger_->setPWMFrequency(BQ25798_PWM_FREQ_750KHZ);
-
-
-//		charger_->setOTGV(5200);
-//		charger_->setOTGLimitA(1500);
-//		charger_->setBackupModeThresh(BQ25798_VBUS_BACKUP_100_PERCENT);
-//		charger_->setOTGenable(true);
-//		charger_->setBackupModeEnable(true);
-
-
-		uint32_t sysmin_v = 0;
-		uint32_t charge_v = 0;
-		uint32_t charge_i = 0;
-		uint32_t input_v = 0;
-		uint32_t input_i = 0;
-		uint32_t precharge_i = 0;
-		uint32_t termcharge_i = 0;
-
-		charger_->getMinSystemV(sysmin_v);
-		charger_->getChargeLimitV(charge_v);
-		charger_->getChargeLimitA(charge_i);
-		charger_->getInputLimitV(input_v);
-		charger_->getInputLimitA(input_i);
-		charger_->getPrechargeLimitA(precharge_i);
-		charger_->getTerminationA(termcharge_i);
-
-		ESP_LOGI(TAG, "    sysmin_v  %6d mV", sysmin_v);
-		ESP_LOGI(TAG, "    charge_v  %6d mV", charge_v);
-		ESP_LOGI(TAG, "    charge_i  %6d mA", charge_i);
-		ESP_LOGI(TAG, "     input_v  %6d mV", input_v);
-		ESP_LOGI(TAG, "     input_i  %6d mA", input_i);
-		ESP_LOGI(TAG, " precharge_i  %6d mA", precharge_i);
-		ESP_LOGI(TAG, "      term_i  %6d mA", termcharge_i);
-
-
-		uint32_t otg_mv;
-		uint32_t otg_ma;
-
-		charger_->getOTGV(otg_mv);
-		charger_->getOTGLimitA(otg_ma);
-
-		bool en = 0;
-		charger_->getBackupModeEnable(en);
-		ESP_LOGI(TAG, "   getBackupModeEnable %d otg v %d a %d", en, otg_mv, otg_ma);
-
-//		rv = sendcmd1("DBfg");
-//		if (rv) {
-//			ESP_LOGE(TAG, "DBfg err");
-//		}
-	}
-
+	int64_t lastsinc = 0;
 	while (running()) {
-		const bool taken = xSemaphoreTake(pending_, pdMS_TO_TICKS(500));
-		if (taken) {
-			readreg(0x14, data);
-			writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
-			ESP_LOGW(TAG, "isr");
-			ESP_LOG_BUFFER_HEXDUMP(TAG, data.data() + 1, data.size() - 1, ESP_LOG_INFO);
-		}
+		initialize();
 
-		if (charger_) {
-			BQ25798::AdcResult adc;
-			uint16_t faults = 0;
-			uint8_t status[5];
-			if (charger_->getAdcResults(adc)) {
-				ESP_LOGI(TAG, "BATT: %6dmV %6dmA", adc.vbat_mv, adc.ibatt_ma);
-				ESP_LOGI(TAG, " BUS: %6dmV %6dmA", adc.vbus_mv, adc.ibus_ma);
-				ESP_LOGI(TAG, " SYS: %6dmV 1 %6d 2 %6d", adc.vsys_mv, adc.vac1_mv, adc.vac2_mv);
-				ESP_LOGI(TAG, "   T: %3d %3d", adc.ts, adc.tdie);
-			}
-			if (charger_->getFaults(faults))
-				ESP_LOGI(TAG, "faults: 0x%4X", faults);
-			if (charger_->getStatus(status))
-				ESP_LOG_BUFFER_HEXDUMP(TAG, status, sizeof(status), ESP_LOG_INFO);
-
-			bool en = 0;
-			if (charger_->getBackupModeEnable(en) && !en) {
-				ESP_LOGI(TAG, "   getBackupModeEnable %d", en);
-				charger_->setBackupModeEnable(true);
+		vTaskDelay(pdMS_TO_TICKS(100));
+		std::vector<uint8_t> data;
+		if (!readreg(0x1A, data)) {
+			const Status_Out* stt = (Status_Out*)(data.data() + 1);
+			if (memcmp(&status, stt, sizeof(status))) {
+				ESP_LOGI(TAG, "Status: [%c] %d %s %s %cFP VB %d HOS %d leg %d bist %d tout %d",
+						stt->plugPresent ? '*' : ' ',
+						stt->connectionState,
+						stt->plugOrientation ? "\\/" : "/\\",
+						stt->portRole ? "src" : "snk",
+						stt->dataRole ? 'D' : 'U',
+						stt->vbusStatus,
+						stt->usbHostPresent,
+						stt->actingLegacy,
+						stt->bist,
+						stt->socAckTout);
+				memcpy(&status, stt, sizeof(status));
 			}
 		}
-//		dump();
-//		for (size_t i = 7; i < ARRAY_SIZE(s_regmap); ++i) {
-//			int rv = readreg(s_regmap[i].addr, data);
-//			if (rv) {
-//				ESP_LOGE(TAG, "%d read 0x%X = %d", i, s_regmap[i].addr, rv);
-//				continue;
-//			}
-//
-//			ESP_LOGW(TAG, "0x%X", s_regmap[i].addr);
-//			ESP_LOG_BUFFER_HEXDUMP(TAG, data.data() + 1, data.size() - 1, ESP_LOG_INFO);
-//		}
+		if (!readreg(0x6A, data)) {
+			const uint8_t *ptr = data.data() + 1;
+			ESP_LOGI(TAG, "ADC: %d %d %d %d   %d %d %d %d    %d %d", ptr[0], ptr[1], ptr[2], ptr[3],   ptr[5], ptr[7], ptr[8], ptr[9],   ptr[10], ptr[11]);
+		}
+		if (!readreg(0x29, data)) {
+			PortControl* pc = (PortControl*)(data.data() + 1);
+			if (!pc->enableCurrentMonitor) {
+				pc->enableCurrentMonitor = 1;
+				writereg(0x29, (uint8_t*)pc, sizeof(*pc));
+			}
+		}
+
+		if (!readreg(0x26, data)) {
+			const PowerPathStatus_Out* stt = (PowerPathStatus_Out*)(data.data() + 1);
+			ESP_LOGI(TAG, "C S1 S3 %d %d %d %d", stt->ppCable1, stt->ppSwitch1, stt->ppSwitch3, stt->powerSource);
+		}
+
 	}
 }
 
@@ -486,6 +457,9 @@ int TPS25751::writereg(int addr, const uint8_t* data, size_t size) noexcept {
 		ESP_LOGE(TAG, "reg 0x%2X len %d but %d given", addr, pair->len, size);
 		return -EINVAL;
 	}
+
+	ESP_LOGV(TAG, "Write: [%2X] %d:", addr, size);
+	ESP_LOG_BUFFER_HEXDUMP(TAG, data, size, ESP_LOG_VERBOSE);
 
 	uint8_t count = size;
 	i2c_master_transmit_multi_buffer_info_t mul[] = {
@@ -525,43 +499,70 @@ int TPS25751::readreg(int addr, std::vector<uint8_t>& data) noexcept {
 }
 
 
-int TPS25751::sendcmd1(const char* data) noexcept {
+int TPS25751::write_4CC(const char* cc4, const void* tx, size_t tx_len, std::vector<uint8_t>& data) noexcept {
+	data.resize(64);
+	return write_4CC(cc4, tx, tx_len, data.data(), data.size());
+}
 
-	xSemaphoreTake(pending_, 0);
-	int rv = writereg(0x08, (const uint8_t*)data, 4);
-	if (rv) {
-		ESP_LOGE(TAG, "cmd1 %.4s write %d", data, rv);
-		return rv;
-	}
+int TPS25751::write_4CC(const char* cc4, const void* tx, size_t tx_len, void* rx, size_t rx_len) noexcept {
 
-	if (xSemaphoreTake(pending_, pdMS_TO_TICKS(150))) {
-		rv = writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
+	std::lock_guard<MutexRecursiveFr> guard(lock_);
+
+	int rv = 0;
+	if (tx && tx_len) {
+		rv = writereg(0x09, (const uint8_t*)tx, tx_len);
 		if (rv) {
-			ESP_LOGE(TAG, "cmd1 %.4s clear irq %d", data, rv);
+			ESP_LOGE(TAG, "4CC '%.4s' data write %d", cc4, rv);
 			return rv;
 		}
-	} else {
-		ESP_LOGE(TAG, "cmd1 %.4s timeout", data);
-		return -ETIMEDOUT;
+	}
+
+	writereg(0x18, s_clearIrq, sizeof(s_clearIrq));
+	xSemaphoreTake(pending_, 0);
+	rv = writereg(0x08, (const uint8_t*)cc4, 4);
+	if (rv) {
+		ESP_LOGE(TAG, "4CC '%.4s' write %d", cc4, rv);
+		return rv;
 	}
 
 	uint8_t ack[5];
-	rv = readreg(0x08, ack, sizeof(ack));
-	if (rv) {
-		ESP_LOGE(TAG, "cmd1 %.4s ack read %d", data, rv);
-		return rv;
-	}
-	if (ack[0] != 4) {
-		ESP_LOGE(TAG, "cmd1 %.4s ack invalid len %d", data, ack[0]);
-		return -1;
+	int done = xSemaphoreTake(pending_, pdMS_TO_TICKS(50));
+	if (!done) { // command not yet executed
+		if ((rv = readreg(0x08, ack, sizeof(ack)))) {
+			ESP_LOGE(TAG, "4CC '%.4s' ack read %d", cc4, rv);
+			return rv;
+		}
+		if (ack[0] != 4) {
+			ESP_LOGE(TAG, "4CC '%.4s' ack invalid len %d", cc4, ack[0]);
+			return -1;
+		}
+		if (ack[1] == '!') {
+			ESP_LOGE(TAG, "4CC '%.4s' nack '%.4s'", cc4, ack + 1);
+			return -1;
+		}
+		done = xSemaphoreTake(pending_, pdMS_TO_TICKS(250)); // continue waiting
 	}
 
-	const uint8_t value = *(uint32_t*)(ack + 1);
-	if (value) {
-		ESP_LOGE(TAG, "cmd1 %.4s ack 0x%X", data, value);
-		return -1;
+	if (!done) {
+		ESP_LOGE(TAG, "4CC '%.4s' timeout", cc4);
+		return -ETIMEDOUT;
 	}
-	return 0;
+
+	bool ackchek = false;
+	if (!rx || !rx_len) {
+		rx = ack;
+		rx_len = sizeof(ack);
+		ackchek = true;
+	}
+
+	if ((rv = readreg(0x09, (uint8_t*)rx, rx_len))) {
+		ESP_LOGE(TAG, "4CC '%.4s' read %d", cc4, rv);
+	}
+
+	if (ackchek && ack[1])
+		ESP_LOGE(TAG, "4CC '%.4s' ack %d %d %d %d %d", cc4, ack[0], ack[1], ack[2], ack[3], ack[4]);
+
+	return ackchek ? -ack[1] : 0;
 }
 
 constexpr TPS25751::State TPS25751::decodeState(const uint8_t *data) noexcept {
@@ -617,7 +618,7 @@ int TPS25751::loadPatch(int addr, const uint8_t *data, size_t size) {
 		vTaskDelay(pdMS_TO_TICKS(1));
 	}
 
-	i2c_master_bus_rm_device(write_dev);
+	ESP_ERROR_CHECK(i2c_master_bus_rm_device(write_dev));
 
 	return 0;
 }
@@ -684,21 +685,9 @@ int TPS25751::i2c_read_single(uint8_t devaddr, uint8_t regaddr, uint8_t *data, s
 		.regaddr = regaddr,
 		.len = len,
 	};
-
-	int rv = writereg(0x09, (const uint8_t*)&wr, sizeof(wr));
-	if (rv) {
-		ESP_LOGE(TAG, "i2c 0x%02X read %d", devaddr, rv);
-		return rv;
-	}
-
-	rv = sendcmd1("I2Cr");
-	if (rv) {
-		ESP_LOGE(TAG, "i2c 0x%02X read %d", devaddr, rv);
-		return rv;
-	}
-
 	I2Cr_out out = {};
-	rv = readreg(0x09, (uint8_t*)&out, sizeof(out));
+
+	int rv = write_4CC("I2Cr", &wr, sizeof(wr), &out, sizeof(out));
 	if (rv) {
 		ESP_LOGE(TAG, "i2c 0x%02X read %d", devaddr, rv);
 		return rv;
@@ -741,141 +730,16 @@ int TPS25751::i2c_write_single(uint8_t devaddr, uint8_t regaddr, const uint8_t *
 		.len = len + 1,
 		.regaddr = regaddr,
 	};
+	I2Cw_out out = {};
 
 	memcpy(wr.data, data, len);
 
-	int rv = writereg(0x09, (const uint8_t*)&wr, sizeof(wr));
+	int rv = write_4CC("I2Cw", &wr, sizeof(wr), &out, sizeof(out));
 	if (rv) {
 		ESP_LOGE(TAG, "i2c 0x%02X write %d", devaddr, rv);
-		return rv;
-	}
-
-	rv = sendcmd1("I2Cw");
-	if (rv) {
-		ESP_LOGE(TAG, "i2c 0x%02X write %d", devaddr, rv);
-		return rv;
-	}
-
-	I2Cw_out out = {};
-	rv = readreg(0x09, (uint8_t*)&out, sizeof(out));
-	if (rv) {
-		ESP_LOGE(TAG, "i2c 0x%02X read %d", devaddr, rv);
 		return rv;
 	}
 
 	return out.ret ? -EIO : 0;
 }
 
-
-void TPS25751::dump() {
-	dumpStatus();
-	dumpPowerPath();
-	dumpPdo(0x30, "Rx SRC");
-//	dumpPdo(0x31, "Rx Sink");
-//	dumpPdo(0x32, "Tx SRC", 2);
-//	dumpPdo(0x33, "Tx Sink");
-
-//	std::vector<uint8_t> data;
-//	if (!readreg(0x37, data)) {
-//		const AutonegotiateSink *as = (AutonegotiateSink*)(data.data() + 1);
-//		ESP_LOGW(TAG, " autoPrioLowVolt %d", as->autoPrioLowVolt);
-//		ESP_LOGW(TAG, " noUsbSuspend %d", as->autoComputeSinkPower);
-//		ESP_LOGW(TAG, " autoComputeSinkPower %d", as->autoPrioLowVolt);
-//		ESP_LOGW(TAG, " noCapMissmatch %d", as->noCapMissmatch);
-//		ESP_LOGW(TAG, " autoComputeSinkMinVolt %d", as->autoComputeSinkMinVolt);
-//		ESP_LOGW(TAG, " autoComputeSinkMaxVolt %d", as->autoComputeSinkMaxVolt);
-//		ESP_LOGW(TAG, " autoDisableSink %d", as->autoDisableSink);
-//		ESP_LOGW(TAG, " autoNegSinkMinPower %d", as->autoNegSinkMinPower * 250);
-//		ESP_LOGW(TAG, " autoNegMaxVolt %d", as->autoNegMaxVolt * 50);
-//		ESP_LOGW(TAG, " autoNegMinVolt %d", as->autoNegMinVolt * 50);
-//		ESP_LOGW(TAG, " autoNegMissmatchPower %d", as->autoNegMissmatchPower * 250);
-//		ESP_LOGW(TAG, " ppsEnaSink %d", as->ppsEnaSink);
-//		ESP_LOGW(TAG, " ppsReqInterval %d", as->ppsReqInterval);
-//		ESP_LOGW(TAG, " ppsSourceMode %d", as->ppsSourceMode);
-//		ESP_LOGW(TAG, " ppsReqFullVolt %d", as->ppsReqFullVolt);
-//		ESP_LOGW(TAG, " ppsDisSinkNotAPDO %d", as->ppsDisSinkNotAPDO);
-//		ESP_LOGW(TAG, " ppsOpCurrent %d", as->ppsOpCurrent * 50);
-//		ESP_LOGW(TAG, " ppsOpVoltage %d", as->ppsOpVoltage * 20);
-//	}
-
-
-}
-
-void TPS25751::dumpStatus() {
-
-	char textic[256];
-	std::vector<uint8_t> data;
-	readreg(0x1A, data);
-	const Status_Out* stt = (Status_Out*)(data.data() + 1);
-
-	int occ = snprintf(textic, sizeof(textic), "%s", stt->plugPresent ? "Plugged" : "empty");
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\nConn %d", stt->connectionState);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n%s", stt->plugOrientation ? "UD" : "UU");
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n%s", stt->portRole ? "source" : "sink");
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n%s", stt->dataRole ? "DFP" : "UFP");
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\nvbus %d", stt->vbusStatus);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\nusbHost %d", stt->usbHostPresent);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\nlegacy %d", stt->actingLegacy);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\nbist %d", stt->bist);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\ntout %d", stt->socAckTout);
-
-	ESP_LOGI(TAG, "Status_Out %d %s", occ, textic);
-}
-
-void TPS25751::dumpPowerPath() {
-
-	char textic[256];
-	std::vector<uint8_t> data;
-	readreg(0x26, data);
-	const PowerPathStatus_Out* stt = (PowerPathStatus_Out*)(data.data() + 1);
-
-	int occ = snprintf(textic, sizeof(textic), "ppCable1 %d", stt->ppCable1);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n ppSwitch1 %d", stt->ppSwitch1);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n ppSwitch3 %d", stt->ppSwitch3);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n pp1overcurrent %d %d", stt->pp1overcurrent, stt->ppCable1overcurrent);
-	occ += snprintf(textic + occ, sizeof(textic) - occ, "\n powerSource %d", stt->powerSource);
-
-	ESP_LOGI(TAG, "power %d %s", occ, textic);
-}
-
-void TPS25751::dumpPdo(int addr, const char* text, int extraOffset) {
-
-	std::vector<uint8_t> data;
-	readreg(addr, data);
-	const size_t count = data.data()[1];
-	const USB_PDO* stt = (USB_PDO*)(data.data() + 2 + extraOffset);
-
-	if (sizeof(USB_PDO) != 4) {
-		ESP_LOGE(TAG, "aaa %d %d", sizeof(USB_PDO), sizeof(USB_PDO_fixed));
-		abort();
-	}
-
-	if (count > 7) {
-		ESP_LOGE(TAG, "unsupported pdos %zu", count);
-		ESP_LOG_BUFFER_HEXDUMP(TAG, data.data() + 1, data.size() - 1, ESP_LOG_INFO);
-		return;
-	}
-
-	for (size_t i = 0; i < count; ++i) {
-		char textic[512];
-		int occ = snprintf(textic, sizeof(textic), "%d: 0x%8X type %d", i, stt[i].raw, stt[i].type);
-		if (!stt[i].type) {
-			occ += snprintf(textic + occ, sizeof(textic) - occ, "\n dual %d", stt[i].fix.dualRole);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " data %d", stt[i].fix.dualRoleData);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " susp %d", stt[i].fix.suspendSupported);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " unco %d", stt[i].fix.unconstraintPower);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " usb %d", stt[i].fix.usbCappable);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " uck %d", stt[i].fix.unchunkedExt);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " epr %d", stt[i].fix.eprCappable);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " peak %d", stt[i].fix.peakCurrent);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, "\n %5dmV", stt[i].fix.voltage * 50);
-			occ += snprintf(textic + occ, sizeof(textic) - occ, " %5dmA", stt[i].fix.maxCurrent * 10);
-		} else {
-//			occ += snprintf(textic + occ, sizeof(textic) - occ, "\n dual %d", stt[i].fix.dualRole);
-		}
-		if (text)
-			ESP_LOGI(TAG, "PDO %s %s", text, textic);
-		else
-			ESP_LOGI(TAG, "PDO 0x%X %s", addr, textic);
-	}
-}

@@ -46,6 +46,16 @@ bool BQ25798::setBit(int regaddr, int bitoffset, bool bv, const char *calle) {
 	return !write_(addr_, regaddr, &val, 1);
 }
 
+int BQ25798::readReg(uint8_t regaddr) {
+	uint8_t val = 0;
+	int rv = read_(addr_, regaddr, &val, sizeof(val));
+	if (rv) {
+		ESP_LOGE(TAG, "failed %d", rv);
+		return rv > 0 ? -rv : rv;
+	}
+	return val;
+}
+
 
 bool BQ25798::getAdcState(bool& on) {
 	return getBit(BQ25798_REG_ADC_CONTROL, 7, on, __FUNCTION__);

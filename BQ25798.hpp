@@ -45,6 +45,9 @@ private:
 	bool setBit(int regaddr, int bitoffset, bool val, const char *calle);
 
 public:
+
+	int readReg(uint8_t regaddr);
+
 	bool getAdcState(bool& on);
 	bool setAdcState(bool on);
 
