@@ -76,6 +76,7 @@ BaseUI::~BaseUI() noexcept {
 int BaseUI::initialzie_panel() noexcept {
 	int rv = 0;
 	size_t wait4 = 0;
+	int first_log = 1;
 	while (need_init_ && running()) {
 		usleep(1000 * wait4);
 		wait4 = (wait4 << 1) + 1;
@@ -88,7 +89,10 @@ int BaseUI::initialzie_panel() noexcept {
 		}
 
 		if ((rv = create_panel())) {
-			ESP_LOGE(TAG, "create_panel %d", rv);
+			if (first_log) {
+				ESP_LOGE(TAG, "create_panel %d", rv);
+				first_log = 0;
+			}
 			continue;
 		}
 

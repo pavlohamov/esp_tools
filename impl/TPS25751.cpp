@@ -278,6 +278,14 @@ bool TPS25751::read_active_pdo(usbpd::pdo& pdo) {
 	return true;
 }
 
+bool TPS25751::is_pugged() {
+	uint8_t buff[sizeof(Status_Out) + 1];
+	if (readreg(0x1A, buff, sizeof(buff)))
+		return false;
+	const Status_Out* stt = (Status_Out*)(buff + 1);
+	return stt->plugPresent;
+}
+
 int TPS25751::initialize() {
 
 	std::vector<uint8_t> data;
@@ -414,7 +422,7 @@ void TPS25751::run() noexcept {
 		}
 		if (!readreg(0x6A, data)) {
 			const uint8_t *ptr = data.data() + 1;
-			ESP_LOGI(TAG, "ADC: %d %d %d %d   %d %d %d %d    %d %d", ptr[0], ptr[1], ptr[2], ptr[3],   ptr[5], ptr[7], ptr[8], ptr[9],   ptr[10], ptr[11]);
+			ESP_LOGV(TAG, "ADC: %d %d %d %d   %d %d %d %d    %d %d", ptr[0], ptr[1], ptr[2], ptr[3],   ptr[5], ptr[7], ptr[8], ptr[9],   ptr[10], ptr[11]);
 		}
 		if (!readreg(0x29, data)) {
 			PortControl* pc = (PortControl*)(data.data() + 1);
@@ -426,7 +434,7 @@ void TPS25751::run() noexcept {
 
 		if (!readreg(0x26, data)) {
 			const PowerPathStatus_Out* stt = (PowerPathStatus_Out*)(data.data() + 1);
-			ESP_LOGI(TAG, "C S1 S3 %d %d %d %d", stt->ppCable1, stt->ppSwitch1, stt->ppSwitch3, stt->powerSource);
+			ESP_LOGV(TAG, "C S1 S3 %d %d %d %d", stt->ppCable1, stt->ppSwitch1, stt->ppSwitch3, stt->powerSource);
 		}
 
 	}

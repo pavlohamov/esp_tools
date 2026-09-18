@@ -48,6 +48,8 @@ public:
 
 	bool read_active_pdo(usbpd::pdo& pdo);
 
+	bool is_pugged();
+
 protected:
 	virtual void run() noexcept;
 private:
