@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <functional>
 
 #include "Singleton.hpp"
 
@@ -22,8 +23,7 @@ enum {
 	RELEASE,
 };
 
-typedef void (*onButtonEvt_f) (int btn, int evt, void *arg);
-
+using onButtonEvt_f = std::function<void(int btn, int evt, void *arg)>;
 
 class Button;
 

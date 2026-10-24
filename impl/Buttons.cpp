@@ -86,7 +86,7 @@ public:
 			esp_timer_stop(b->_tim);
 			ESP_ERROR_CHECK(esp_timer_start_once(b->_tim, TOUT_DEBOUNCE_US));
 		} else {
-			ESP_ERROR_CHECK(esp_timer_stop(b->_tim));
+			esp_timer_stop(b->_tim);
 			int was = b->_state;
 			b->_state = STT_RELEASED;
 			b->_pressedAt = 0;
