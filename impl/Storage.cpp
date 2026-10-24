@@ -19,10 +19,10 @@ Storage::Storage(const char *label) : _lbl(label), _handle(nullptr) { }
 
 int Storage::init() {
 
+	std::lock_guard<MutexRecursiveFr> guard(_lock);
+
 	if (_handle)
 		return 0;
-
-	std::lock_guard<MutexRecursiveFr> guard(_lock);
 
 	int err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {

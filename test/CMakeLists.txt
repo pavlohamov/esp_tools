@@ -2,6 +2,7 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
+set(IDF_TARGET esp32s3)
 
 set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig.prj")
 set(SDKCONFIG_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults")

@@ -6,8 +6,12 @@ string(TIMESTAMP BUILD_DATE "%Y-%m-%d %H:%M:%S UTC" UTC)
 
 FILE(GLOB SRC
 	${CMAKE_CURRENT_SOURCE_DIR}/../*.c*
-
 	${CMAKE_CURRENT_SOURCE_DIR}/../../impl/*.c*
+)
+
+list(REMOVE_ITEM SRC
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../impl/UI.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../impl/TPS25751.cpp"
 )
 
 target_include_directories(${COMPONENT_LIB} PRIVATE
