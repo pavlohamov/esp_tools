@@ -32,7 +32,7 @@ enum {
 
 class Buttons::Button {
 public:
-	Button(gpio_num_t gpio, bool actlo, int btn, onButtonEvt_f cb, void *arg): _gpio(gpio), _actlo(actlo), _signal(btn), _cb(cb), _arg(arg), _state(STT_RELEASED), _pressedAt(0) {
+	Button(gpio_num_t gpio, bool actlo, int btn, onButtonEvt cb, void *arg): _gpio(gpio), _actlo(actlo), _signal(btn), _cb(cb), _arg(arg), _state(STT_RELEASED), _pressedAt(0) {
 
 		const esp_timer_create_args_t initer = {
 			.callback = onTout,
@@ -72,7 +72,7 @@ private:
 	const gpio_num_t _gpio;
 	const bool _actlo;
 	const int _signal;
-	const onButtonEvt_f _cb;
+	const onButtonEvt _cb;
 	void *const _arg;
 	int _state;
 	esp_timer_handle_t _tim;
@@ -130,7 +130,7 @@ public:
 	}
 };
 
-std::shared_ptr<Button> Wrapper::add(int gpio, bool actlo, int signal, onButtonEvt_f cb, void *arg) {
+std::shared_ptr<Button> Wrapper::add(int gpio, bool actlo, int signal, onButtonEvt cb, void *arg) {
 	auto b = std::make_shared<Button>((gpio_num_t)gpio, actlo, signal, cb, arg);
 	if (!b) {
 		ESP_LOGE(TAG, "No MEM!");

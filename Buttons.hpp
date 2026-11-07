@@ -23,7 +23,7 @@ enum {
 	RELEASE,
 };
 
-using onButtonEvt_f = std::function<void(int btn, int evt, void *arg)>;
+using onButtonEvt = std::function<void(int btn, int evt, void *arg)>;
 
 class Button;
 
@@ -32,7 +32,7 @@ private:
 	friend class Singleton<Wrapper>;
 public:
 
-	std::shared_ptr<Button> add(int gpio, bool actlo, int signal, onButtonEvt_f cb, void *arg);
+	std::shared_ptr<Button> add(int gpio, bool actlo, int signal, onButtonEvt cb, void *arg);
 	bool del(std::shared_ptr<Button>& b);
 
 //   0 - released

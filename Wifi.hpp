@@ -33,6 +33,8 @@ public:
     [[nodiscard]] bool scan_unsubscribe(ScanHandle cb) noexcept;
 
     [[nodiscard]] bool scan() noexcept;
+
+    [[nodiscard]] bool connected() noexcept { return _inited && _ipready;}
 private:
 	friend class Singleton<Wifi>;
 
