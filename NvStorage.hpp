@@ -75,6 +75,10 @@ public:
 		return set(el, off);
 	}
 
+	bool erase() {
+		return be_.erase(max_size);
+	}
+
 private:
 	Backend& be_;
 
