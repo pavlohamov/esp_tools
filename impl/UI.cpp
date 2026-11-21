@@ -28,9 +28,13 @@ static void on_lvgl_tick(void *arg) {
     lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
 }
 
+static inline int64_t now_ms() {
+	return esp_timer_get_time() / 1000;
+}
 
 BaseUI::BaseUI(uint16_t hres, uint16_t vres) noexcept: Runnable("BaseUi"),
-		hres_(hres), vres_(vres), panel_io_(nullptr), panel_(nullptr), lvgl_tick_timer_(nullptr), display_(nullptr), fb0_(nullptr), fb1_(nullptr), need_init_(true) {
+		hres_(hres), vres_(vres), panel_io_(nullptr), panel_(nullptr), lvgl_tick_timer_(nullptr), display_(nullptr),
+		need_init_(true), keepalive_ms_(0), fb0_(nullptr), fb1_(nullptr) {
 	_lock_init(&lock_);
 
 // todo: this must be executed only once
@@ -41,7 +45,10 @@ BaseUI::BaseUI(uint16_t hres, uint16_t vres) noexcept: Runnable("BaseUi"),
 		lv_init();
 		const esp_timer_create_args_t lvgl_tick_timer_args = {
 			.callback = on_lvgl_tick,
-			.name = "lvgl_tick"
+			.arg = nullptr,
+			.dispatch_method = ESP_TIMER_TASK,
+			.name = "lvgl_tick",
+			.skip_unhandled_events = false,
 		};
 		ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer_));
 		ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer_, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
@@ -109,19 +116,28 @@ int BaseUI::initialzie_panel() noexcept {
 	return rv;
 }
 
+void BaseUI::invalidate_all() noexcept {
+	if (!display_)
+		return;
+	lock();
+	// screen object covers whole display; top/sys layers are redrawn in the same area
+	lv_obj_invalidate(lv_display_get_screen_active(display_));
+	unlock();
+}
+
 void BaseUI::run() noexcept {
 
-	_lock_acquire(&lock_);
+	lock();
 	int rv = 0;
 	if ((rv = create_io())) {
-		_lock_release(&lock_);
+		unlock();
 		ESP_LOGE(TAG, "create_io %d", rv);
 		return;
 	}
 
 	if ((rv = initialzie_lvgl())) {
 		ESP_LOGE(TAG, "initialzie_lvgl %d", rv);
-		_lock_release(&lock_);
+		unlock();
 		return;
 	}
 
@@ -129,19 +145,30 @@ void BaseUI::run() noexcept {
 		.on_color_trans_done = on_flush_ready,
 	};
 	ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(panel_io_, &cbs, display_));
-	_lock_release(&lock_);
+	unlock();
 
+	int64_t keepalive_at = now_ms() + keepalive_ms_;
 	while (running()) {
 
 		if (need_init_) {
 			initialzie_panel();
+			invalidate_all();
 			continue;
 		}
 
+		if (keepalive_ms_ && now_ms() >= keepalive_at) {
+			keepalive_at = now_ms() + keepalive_ms_;
+			if (!is_alive()) {
+				ESP_LOGW(TAG, "keepalive failed %d -> reinit", rv);
+				need_init_ = true;
+				continue;
+			}
+		}
+
 		draw();
-		_lock_acquire(&lock_);
+		lock();
 		uint32_t sleep4_ms = lv_timer_handler();
-		_lock_release(&lock_);
+		unlock();
 		sleep4_ms = MAX(sleep4_ms, MIN_DELAY_MS);
 		sleep4_ms = MIN(sleep4_ms, MAX_DELAY_MS);
 		// todo: replace with queue

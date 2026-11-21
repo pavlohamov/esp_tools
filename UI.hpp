@@ -9,6 +9,7 @@
 
 #include "Runnable.hpp"
 
+#include <atomic>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/lock.h>
@@ -27,8 +28,11 @@ public:
 		return display_;
 	}
 
-	inline void lock() { _lock_acquire(&lock_); }
-	inline void unlock() { _lock_release(&lock_); }
+	void requesReinit() { need_init_ = true; }
+
+	inline void lock() { _lock_acquire_recursive(&lock_); }
+	inline bool try_lock() { return _lock_try_acquire_recursive(&lock_) == 0; }
+	inline void unlock() { _lock_release_recursive(&lock_); }
 
 protected:
 	virtual void run() noexcept;
@@ -38,6 +42,10 @@ protected:
 	virtual int configure_panel() noexcept = 0;
 	virtual int initialzie_lvgl() noexcept = 0;
 	virtual void draw() noexcept = 0;
+
+	virtual bool is_alive() noexcept { return !need_init_; }
+
+	void invalidate_all() noexcept;
 
 private:
 	int initialzie_panel() noexcept;
@@ -50,7 +58,8 @@ protected:
 	esp_lcd_panel_handle_t panel_;
 	esp_timer_handle_t lvgl_tick_timer_;
 	lv_display_t *display_;
-	bool need_init_;
+	std::atomic<bool> need_init_;
+	uint32_t keepalive_ms_;
 
 	void *fb0_;
 	void *fb1_;
