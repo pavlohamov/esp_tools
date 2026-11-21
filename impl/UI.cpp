@@ -13,7 +13,7 @@
 #include "esp_log.h"
 static const char *TAG = "UI";
 
-#define MAX_DELAY_MS 500
+#define MAX_DELAY_MS 50
 #define MIN_DELAY_MS 1000 / CONFIG_FREERTOS_HZ
 
 #define EXAMPLE_LVGL_TICK_PERIOD_MS    5
